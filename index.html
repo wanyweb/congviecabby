@@ -1480,8 +1480,67 @@
             return fallback;
         }
 
+        // IndexedDB mirror for larger caches. localStorage remains the synchronous
+        // bootstrap/fallback during this compatibility release; IDB is written asynchronously.
+        const CACHE_DB_NAME = 'abby_shift_cache_v1';
+        let cacheDbPromise = null;
+        function openCacheDb() {
+            if (!('indexedDB' in window)) return Promise.reject(new Error('IndexedDB không khả dụng'));
+            if (!cacheDbPromise) cacheDbPromise = new Promise((resolve, reject) => {
+                const req = indexedDB.open(CACHE_DB_NAME, 1);
+                req.onupgradeneeded = () => { if (!req.result.objectStoreNames.contains('cache')) req.result.createObjectStore('cache'); };
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error || new Error('Không mở được IndexedDB'));
+            });
+            return cacheDbPromise;
+        }
+        async function writeCacheToIndexedDb(key, value) {
+            const db = await openCacheDb();
+            await new Promise((resolve, reject) => {
+                const tx = db.transaction('cache', 'readwrite');
+                tx.objectStore('cache').put(value, key);
+                tx.oncomplete = resolve;
+                tx.onerror = () => reject(tx.error || new Error('Không ghi được IndexedDB'));
+                tx.onabort = () => reject(tx.error || new Error('Giao dịch IndexedDB bị hủy'));
+            });
+        }
+        async function readCacheFromIndexedDb(key) {
+            const db = await openCacheDb();
+            return await new Promise((resolve, reject) => {
+                const req = db.transaction('cache', 'readonly').objectStore('cache').get(key);
+                req.onsuccess = () => resolve(req.result === undefined ? null : req.result);
+                req.onerror = () => reject(req.error || new Error('Không đọc được IndexedDB'));
+            });
+        }
         function setCachedValue(base, value) {
-            localStorage.setItem(scopedStorageKey(base), JSON.stringify(value));
+            const key = scopedStorageKey(base);
+            const serialized = JSON.stringify(value);
+            try { localStorage.setItem(key, serialized); }
+            catch (storageError) {
+                // Preserve the cache even if localStorage quota is exceeded. Legacy sync
+                // reads will still fall back to cloud until the async IDB hydrate completes.
+                writeCacheToIndexedDb(key, value).catch(err => console.warn('IndexedDB cache write failed:', err));
+                throw storageError;
+            }
+            if (serialized.length > 150000) {
+                writeCacheToIndexedDb(key, value).catch(err => console.warn('IndexedDB cache mirror failed:', err));
+            }
+        }
+        async function hydrateLargeCachesFromIndexedDb() {
+            const bases = ['shift_tasks_data','shift_schedule_data','shift_schedule_notes','shift_employees_data','shift_cash_data','shift_variance_data'];
+            for (const base of bases) {
+                const key = scopedStorageKey(base);
+                try {
+                    let local = null;
+                    try { local = localStorage.getItem(key); } catch (_) {}
+                    if (local !== null) continue;
+                    const value = await readCacheFromIndexedDb(key);
+                    if (value !== null && CURRENT_STORE_ID) {
+                        // Do not overwrite an existing synchronous cache; hydrate only missing keys.
+                        try { localStorage.setItem(key, JSON.stringify(value)); } catch (_) {}
+                    }
+                } catch (err) { /* Cloud remains the source of truth if IndexedDB is unavailable. */ }
+            }
         }
 
         function hasTaskCacheRecord() {
@@ -1673,6 +1732,7 @@
             }
 
             CURRENT_STORE_ID = storeId;
+            await hydrateLargeCachesFromIndexedDb().catch(err => console.warn('IndexedDB cache hydration skipped:', err));
             try { localStorage.setItem('shift_current_store', CURRENT_STORE_ID); } catch (error) { console.warn('Không ghi được cửa hàng hiện tại vào cache:', error); }
             employees = (getCachedValue('shift_employees_data', []) || []).map(normalizeEmployee);
             tasks = getCachedValue('shift_tasks_data', []) || [];
@@ -2142,6 +2202,56 @@
             }
         }
 
+        const TASK_IMAGE_BUCKET = 'task-images-public';
+        function isDataImage(value) { return typeof value === 'string' && /^data:image\//i.test(value); }
+        function isHttpImage(value) { return typeof value === 'string' && /^https?:\/\//i.test(value); }
+        async function uploadTaskImageIfNeeded(value, taskId, kind, index) {
+            if (!isDataImage(value)) return value; // supports existing public URLs and legacy values
+            if (!cloudSyncEnabled || !CURRENT_STORE_ID) throw new Error('Cần kết nối online để chuyển ảnh lên Storage.');
+            const parts = value.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,([\s\S]+)$/);
+            if (!parts) throw new Error('Ảnh Base64 không đúng định dạng.');
+            const mime = parts[1].toLowerCase();
+            const binary = atob(parts[2]);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+            const ext = mime === 'image/png' ? 'png' : mime === 'image/webp' ? 'webp' : 'jpg';
+            const safeStore = String(CURRENT_STORE_ID).replace(/[^a-zA-Z0-9_-]/g, '_');
+            const safeTask = String(taskId).replace(/[^a-zA-Z0-9_-]/g, '_');
+            const path = `${safeStore}/${safeTask}/${kind}-${Date.now()}-${index}-${crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2)}.${ext}`;
+            const { data, error } = await supabaseClient.storage.from(TASK_IMAGE_BUCKET).upload(path, new Blob([bytes], { type: mime }), { contentType: mime, upsert: false, cacheControl: '31536000' });
+            if (error) throw error;
+            const { data: publicData } = supabaseClient.storage.from(TASK_IMAGE_BUCKET).getPublicUrl(data.path);
+            if (!publicData?.publicUrl) throw new Error('Không tạo được URL ảnh công khai.');
+            return publicData.publicUrl;
+        }
+        async function migrateTaskImagesToStorage(task) {
+            if (!task || task._imagesLoaded === false) return;
+            const taskId = task.id || `new-${Date.now()}`;
+            const proof = Array.isArray(task.proofImages) ? task.proofImages : (task.proofImage ? [task.proofImage] : []);
+            const reason = Array.isArray(task.reasonImages) ? task.reasonImages : [];
+            let changed = false;
+            const nextProof = [];
+            for (let i = 0; i < proof.length; i++) {
+                const url = await uploadTaskImageIfNeeded(proof[i], taskId, 'proof', i);
+                if (url !== proof[i]) changed = true;
+                nextProof.push(url);
+            }
+            const nextReason = [];
+            for (let i = 0; i < reason.length; i++) {
+                const url = await uploadTaskImageIfNeeded(reason[i], taskId, 'reason', i);
+                if (url !== reason[i]) changed = true;
+                nextReason.push(url);
+            }
+            if (changed) {
+                task.proofImages = nextProof;
+                task.reasonImages = nextReason;
+                if (task.proofImage && nextProof.length) task.proofImage = nextProof[0];
+            }
+        }
+        async function migrateAllLoadedTaskImagesToStorage() {
+            for (const task of tasks) await migrateTaskImagesToStorage(task);
+        }
+
         function taskToRow(t) {
             const row = { store_id:CURRENT_STORE_ID, id:t.id, group_id:t.groupId||null, title:t.title||'', shift:t.shift||'', priority:t.priority||'', assignee:t.assignee||'', deadline:t.deadline||'', reason:t.reason||'', reason_time:t.reasonTime||'', completed:!!t.completed, date:t.date||null, repeat_type:t.repeatType||'NONE', require_image:!!t.requireImage, effective_date:t.effectiveDate||null, effective_shift:t.effectiveShift||null };
             // If photo columns were not fetched, omit them from UPDATE payloads. This prevents
@@ -2333,6 +2443,66 @@
             return Object.prototype.hasOwnProperty.call(readTaskDeletionTombstones(), String(id));
         }
 
+        // Shared deletion ledger: unlike browser-local tombstones, this survives device changes.
+        // SQL file supplied with this patch creates the table and its RLS policies.
+        async function syncTaskDeletionTombstonesToCloud(ids = readPendingTaskDeletionIds()) {
+            const uniqueIds = [...new Set((ids || []).map(String).filter(Boolean))];
+            if (!uniqueIds.length) return true;
+            const tombstones = readTaskDeletionTombstones();
+            const rows = uniqueIds.filter(id => tombstones[id]).map(id => ({
+                store_id: CURRENT_STORE_ID, task_id: id,
+                deleted_at: new Date(Number(tombstones[id]) || Date.now()).toISOString()
+            }));
+            if (!rows.length) return true;
+            const { error } = await supabaseClient.from('task_deletion_tombstones')
+                .upsert(rows, { onConflict: 'store_id,task_id', ignoreDuplicates: false });
+            if (error) throw error;
+            return true;
+        }
+
+        async function loadSharedTaskDeletionTombstones() {
+            const { data, error } = await supabaseClient.from('task_deletion_tombstones')
+                .select('task_id,deleted_at').eq('store_id', CURRENT_STORE_ID);
+            if (error) throw error;
+            const tombstones = readTaskDeletionTombstones();
+            const pendingStored = getCachedValue(TASK_PENDING_DELETE_KEY, {});
+            const pending = pendingStored && typeof pendingStored === 'object' && !Array.isArray(pendingStored) ? pendingStored : {};
+            (data || []).forEach(row => {
+                const id = String(row.task_id ?? '');
+                if (!id) return;
+                const timestamp = Date.parse(row.deleted_at || '') || Date.now();
+                tombstones[id] = Math.max(Number(tombstones[id]) || 0, timestamp);
+                // A deletion already recorded by the cloud is not an unsynced local deletion.
+                delete pending[id];
+            });
+            const trimmed = Object.fromEntries(Object.entries(tombstones)
+                .sort((a, b) => Number(b[1]) - Number(a[1])).slice(0, TASK_TOMBSTONE_MAX_COUNT));
+            trySetCachedValue(TASK_TOMBSTONE_KEY, trimmed);
+            trySetCachedValue(TASK_PENDING_DELETE_KEY, pending);
+            // Remove tombstoned tasks from the current device immediately, before reconciliation.
+            const before = Array.isArray(tasks) ? tasks.length : 0;
+            tasks = (Array.isArray(tasks) ? tasks : []).filter(task => !trimmed[String(task.id)]);
+            if (tasks.length !== before) trySetCachedValue('shift_tasks_data', tasks);
+            return trimmed;
+        }
+
+        async function applySharedTaskDeletionTombstone(row) {
+            const id = String(row?.task_id ?? '');
+            if (!id) return;
+            const tombstones = readTaskDeletionTombstones();
+            tombstones[id] = Math.max(Number(tombstones[id]) || 0, Date.parse(row.deleted_at || '') || Date.now());
+            trySetCachedValue(TASK_TOMBSTONE_KEY, tombstones);
+            const pendingStored = getCachedValue(TASK_PENDING_DELETE_KEY, {});
+            const pending = pendingStored && typeof pendingStored === 'object' && !Array.isArray(pendingStored) ? pendingStored : {};
+            delete pending[id];
+            trySetCachedValue(TASK_PENDING_DELETE_KEY, pending);
+            tasks = (Array.isArray(tasks) ? tasks : []).filter(task => String(task.id) !== id);
+            setTaskSyncSnapshotEntry(id, null);
+            taskCachePersisted = trySetCachedValue('shift_tasks_data', tasks);
+            if (!taskCachePersisted) removeTaskSyncSnapshotPersistedOnly();
+            renderApp();
+        }
+
         async function deleteRowsAndConfirm(table, ids) {
             const uniqueIds = [...new Set((ids || []).map(String).filter(Boolean))];
             for (let i = 0; i < uniqueIds.length; i += 100) {
@@ -2502,10 +2672,12 @@
                 beginCloudWrite();
                 try {
                     if (tombstonedIds.length) {
+                        await syncTaskDeletionTombstonesToCloud(tombstonedIds);
                         await deleteTaskRowsFromCloud(tombstonedIds);
                         clearPendingTaskDeletionIds(tombstonedIds);
                     }
-                    if (currentRows.length) await upsertRowsCompatible('tasks', currentRows, 'store_id,id', 'id');
+                    const safeRows = currentRows.filter(row => !isTaskDeletionTombstoned(row.id));
+                    if (safeRows.length) await upsertRowsCompatible('tasks', safeRows, 'store_id,id', 'id');
                     writeTaskSyncSnapshot(currentTasks);
                     return true;
                 } catch (err) {
@@ -2565,6 +2737,7 @@
                     await updateTaskCoreRowsWithoutImages(coreOnlyRows);
                 }
                 if (deletedIds.length) {
+                    await syncTaskDeletionTombstonesToCloud(deletedIds);
                     await deleteTaskRowsFromCloud(deletedIds);
                     clearPendingTaskDeletionIds(deletedIds);
                 }
@@ -2601,6 +2774,15 @@
             try {
                 // Cache is best-effort: large proof photos can exceed localStorage quota.
                 // A cache quota error must not prevent an online Supabase write.
+                if (cloudSyncEnabled) {
+                    try {
+                        await migrateAllLoadedTaskImagesToStorage();
+                    } catch (imageError) {
+                        console.error('Task image upload/migration failed:', imageError);
+                        showToast(`Chưa lưu được ảnh lên Storage: ${imageError.message || 'lỗi không xác định'}. Dữ liệu ảnh cũ vẫn được giữ để thử lại.`, 'info');
+                        return false;
+                    }
+                }
                 const cacheSaved = trySetCachedValue('shift_tasks_data', tasks);
                 taskCachePersisted = cacheSaved;
                 if (!cloudSyncEnabled) {
@@ -2759,6 +2941,14 @@
                     .catch(error => console.warn('Today-task preview skipped:', error));
             }
             try {
+                // Pull shared deletions before reading/reconciling tasks so an old local cache
+                // cannot be interpreted as a new task and pushed back into Postgres.
+                await loadSharedTaskDeletionTombstones();
+                const pendingSharedDeletes = readPendingTaskDeletionIds();
+                if (pendingSharedDeletes.length) {
+                    await syncTaskDeletionTombstonesToCloud(pendingSharedDeletes);
+                    // Keep pending IDs until the task rows are physically deleted below.
+                }
                 const [e, t, sResult] = await Promise.all([
                     toQueryResult(fetchRowsPaged('employees', { pageSize: 150, orderColumn: 'code', orderAscending: true, storeId: requestStoreId })),
                     toQueryResult(fetchRowsPaged('tasks', {
@@ -3186,6 +3376,11 @@
                     payload => queueRealtimeEvent(table, payload)
                 );
             });
+            realtimeChannel.on(
+                'postgres_changes',
+                { event: 'INSERT', schema: 'public', table: 'task_deletion_tombstones', filter: `store_id=eq.${CURRENT_STORE_ID}` },
+                payload => { if (payload?.new) applySharedTaskDeletionTombstone(payload.new); }
+            );
             realtimeChannel.subscribe((status, error) => {
                 if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
                     console.warn('Supabase realtime status:', status, error || '');
